@@ -5,6 +5,7 @@
 package freegeoip
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
@@ -178,7 +179,21 @@ func (db *DB) watchEvents(watcher *fsnotify.Watcher) {
 }
 
 func (db *DB) openFile() error {
-	reader, checksum, err := db.newReader(db.file)
+	f, err := os.Open(db.file)
+	if err != nil {
+		return err
+	}
+
+	untar(filepath.Join(os.TempDir(), "freegeoip"), f)
+
+	str := filepath.Join(os.TempDir(), "freegeoip", "/**/GeoLite2-City.mmdb")
+
+	files, err := filepath.Glob(str)
+	if err != nil {
+		return err
+	}
+
+	reader, checksum, err := db.newReader(files[0])
 	if err != nil {
 		return err
 	}
@@ -196,15 +211,12 @@ func (db *DB) newReader(dbfile string) (*maxminddb.Reader, string, error) {
 		return nil, "", err
 	}
 	defer f.Close()
-	gzf, err := gzip.NewReader(f)
+
+	b, err := ioutil.ReadAll(f)
 	if err != nil {
 		return nil, "", err
 	}
-	defer gzf.Close()
-	b, err := ioutil.ReadAll(gzf)
-	if err != nil {
-		return nil, "", err
-	}
+
 	checksum := fmt.Sprintf("%x", md5.Sum(b))
 	mmdb, err := maxminddb.FromBytes(b)
 	return mmdb, checksum, err
@@ -302,8 +314,7 @@ func (db *DB) download(url string) (tmpfile string, err error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	tmpfile = filepath.Join(os.TempDir(),
-		fmt.Sprintf("_freegeoip.%d.db.gz", time.Now().UnixNano()))
+	tmpfile = filepath.Join(os.TempDir(), fmt.Sprintf("_freegeoip.%d.db.gz", time.Now().UnixNano()))
 	f, err := os.Create(tmpfile)
 	if err != nil {
 		return "", err
@@ -335,6 +346,70 @@ func (db *DB) renameFile(name string) error {
 		return err
 	}
 	return os.Rename(name, db.file)
+}
+
+func untar(dst string, r io.Reader) error {
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+
+		switch {
+
+		// if no more files are found return
+		case err == io.EOF:
+			return nil
+
+		// return any other error
+		case err != nil:
+			return err
+
+		// if the header is nil, just skip it (not sure how this happens)
+		case header == nil:
+			continue
+		}
+
+		// the target location where the dir/file should be created
+		target := filepath.Join(dst, header.Name)
+
+		// the following switch could also be done using fi.Mode(), not sure if there
+		// a benefit of using one vs. the other.
+		// fi := header.FileInfo()
+
+		// check the file type
+		switch header.Typeflag {
+
+		// if its a dir and it doesn't exist create it
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					return err
+				}
+			}
+
+		// if it's a file create it
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+
+			// copy over contents
+			if _, err := io.Copy(f, tr); err != nil {
+				return err
+			}
+			
+			// manually close here after each file operation; defering would cause each file close
+			// to wait until all operations have completed.
+			f.Close()
+		}
+	}
 }
 
 // Date returns the UTC date the database file was last modified.
